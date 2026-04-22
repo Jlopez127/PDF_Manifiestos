@@ -326,12 +326,14 @@ def draw_code128_barcode(
         "Code128",
         value=value,
         barHeight=height,
+        barWidth=1.2,  # 👈 clave (ajusta grosor)
         humanReadable=False,
     )
-    scale = min(max_width / drawing.width, 1.5)
-    drawing.scale(scale, 1)
-    actual_width = drawing.width * scale
+
+    # 👇 centrado SIN scale
+    actual_width = drawing.width
     drawing_x = x + (max_width - actual_width) / 2
+
     renderPDF.draw(drawing, pdf, drawing_x, y)
 
 
