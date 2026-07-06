@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
+import random
 import re
 import unicodedata
 import zipfile
@@ -155,7 +157,7 @@ class LabelRow:
     @classmethod
     def from_record(cls, record: dict[str, object]) -> "LabelRow":
         return cls(
-            shipment_number=pick_first(record, ["envio", "guia", "numero de guia", "numero guia"]),
+            shipment_number=pick_first(record, ["envio", "guia", "guia / consignment", "guia consignment", "numero de guia", "numero guia"]),
             shipment_date=pick_first(record, ["fecha guia", "fecha", "fecha envio"]),
             sender_name=pick_first(record, ["compania remitente", "remitente", "remitente nombre"]),
             sender_address=pick_first(record, ["remitente direccion", "direccion remitente"]),
@@ -567,6 +569,613 @@ def generate_zip_bytes(rows: list[LabelRow]) -> bytes:
             archive.writestr(filename, generate_pdf_bytes(row))
 
     return buffer.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# MOTOR DE TEMAS (etiquetas GENERICAS simuladas, SIN marca)
+# ---------------------------------------------------------------------------
+# Este bloque es independiente de la etiqueta con marca Encargomio (draw_label,
+# generate_pdf_bytes, etc.). Aqui SOLO se define el catalogo de estilos; el
+# dibujo de los temas se agrega en un paso posterior.
+#
+# Restricciones de diseno:
+#   - Pagina 4x6 exactas: usar PAGE_WIDTH / PAGE_HEIGHT existentes.
+#   - Solo fuentes built-in de reportlab (sin fuentes externas).
+#   - Ningun texto de marca / logo / nombre de empresa: rotulos genericos.
+
+# Fuentes estandar (built-in) de reportlab; no requieren registro previo.
+THEME_FONT_FAMILIES = (
+    "Helvetica",
+    "Helvetica-Bold",
+    "Courier",
+    "Courier-Bold",
+    "Times-Roman",
+    "Times-Bold",
+)
+
+# Posiciones posibles para el bloque de codigo de barras.
+THEME_BARCODE_POSITIONS = ("top", "top-left", "top-right", "mid")
+
+# Colores de acento (lineas / titulos) en hex.
+THEME_ACCENT_COLORS = (
+    "#111827", "#F97316", "#2563EB", "#059669", "#DC2626", "#7C3AED",
+    "#0891B2", "#CA8A04", "#DB2777", "#4B5563", "#0F766E", "#B91C1C",
+    "#1D4ED8", "#15803D", "#9333EA",
+)
+
+# Colores para el marco exterior en hex.
+THEME_BORDER_COLORS = ("#111827", "#6B7280", "#9CA3AF", "#374151", "#000000")
+
+# Estilos de linea divisoria entre bloques.
+THEME_DIVIDER_STYLES = ("solid", "dashed", "dotted", "double")
+
+# Alineacion de los bloques de texto.
+THEME_ALIGNMENTS = ("left", "center")
+
+# Pares de rotulos GENERICOS (remitente / destinatario). Nunca marca.
+THEME_LABEL_PAIRS = (
+    ("De:", "Para:"),
+    ("Remitente", "Destinatario"),
+    ("From", "To"),
+    ("Origen", "Destino"),
+    ("Envia", "Recibe"),
+    ("Sender", "Recipient"),
+    ("Remite", "Recibe"),
+)
+
+# Bloques que se apilan verticalmente (su orden es parte de la variacion).
+THEME_BASE_BLOCKS = ("barcode", "sender", "recipient", "content")
+
+
+@dataclass(frozen=True)
+class LabelTheme:
+    """Parametros que definen un diseno de etiqueta generica 4x6.
+
+    Un tema NO contiene datos del envio ni marca; solo describe el estilo y el
+    layout. La funcion de dibujo (paso posterior) consume estos parametros.
+    """
+
+    theme_id: int
+    # Codigo de barras
+    barcode_position: str          # "top" | "top-left" | "top-right" | "mid"
+    barcode_height: float          # alto del Code128 en puntos
+    barcode_bar_width: float       # grosor de barra del Code128
+    show_barcode_text: bool        # mostrar el valor legible bajo el codigo
+    # Tipografia
+    font_family: str               # familia base (built-in reportlab)
+    title_size: float
+    body_size: float
+    label_size: float
+    line_leading: float            # factor de interlineado (x body_size)
+    uppercase_labels: bool         # rotulos en MAYUSCULAS
+    # Marco / divisores
+    has_outer_border: bool
+    border_width: float
+    border_color: str              # hex
+    has_divider: bool
+    divider_style: str             # "solid" | "dashed" | "dotted" | "double" | "none"
+    # Color / composicion
+    accent_color: str              # hex
+    alignment: str                 # "left" | "center"
+    padding: float                 # margen interno en puntos
+    block_order: tuple[str, ...]   # orden vertical de los bloques
+    # Rotulos genericos (sin marca)
+    sender_label: str
+    recipient_label: str
+
+    def signature(self) -> str:
+        """Firma visual (excluye theme_id) para detectar temas repetidos."""
+        parts = [
+            f"{name}={getattr(self, name)}"
+            for name in self.__dataclass_fields__
+            if name != "theme_id"
+        ]
+        return "|".join(parts)
+
+    def describe(self) -> str:
+        """Representacion legible multilinea para inspeccion."""
+        lines = [
+            f"Tema #{self.theme_id}",
+            f"  barcode      : pos={self.barcode_position} "
+            f"h={self.barcode_height} bar_w={self.barcode_bar_width} "
+            f"texto={'si' if self.show_barcode_text else 'no'}",
+            f"  tipografia   : {self.font_family} "
+            f"(title={self.title_size} body={self.body_size} "
+            f"label={self.label_size} leading={self.line_leading} "
+            f"mayus={'si' if self.uppercase_labels else 'no'})",
+            f"  marco        : "
+            + (
+                f"si w={self.border_width} color={self.border_color}"
+                if self.has_outer_border
+                else "no"
+            ),
+            f"  divisor      : "
+            + (self.divider_style if self.has_divider else "no"),
+            f"  acento       : {self.accent_color}",
+            f"  alineacion   : {self.alignment}   padding={self.padding}",
+            f"  orden bloques: {' > '.join(self.block_order)}",
+            f"  rotulos      : '{self.sender_label}' / '{self.recipient_label}'",
+        ]
+        return "\n".join(lines)
+
+
+def build_theme_catalog(n: int = 50) -> list[LabelTheme]:
+    """Genera una lista DETERMINISTA de ``n`` temas visualmente distintos.
+
+    La semilla interna (random.Random(42)) garantiza que el catalogo #0..#(n-1)
+    sea siempre el mismo entre ejecuciones. Los temas repetidos (misma firma
+    visual) se descartan para maximizar la variedad.
+    """
+    rng = random.Random(42)
+    catalog: list[LabelTheme] = []
+    seen: set[str] = set()
+    max_attempts = n * 60
+
+    for _ in range(max_attempts):
+        if len(catalog) >= n:
+            break
+
+        block_order = list(THEME_BASE_BLOCKS)
+        rng.shuffle(block_order)
+        sender_label, recipient_label = rng.choice(THEME_LABEL_PAIRS)
+        has_outer_border = rng.random() < 0.70
+        has_divider = rng.random() < 0.75
+
+        theme = LabelTheme(
+            theme_id=len(catalog),
+            barcode_position=rng.choice(THEME_BARCODE_POSITIONS),
+            barcode_height=round(rng.uniform(28.0, 48.0), 1),
+            barcode_bar_width=round(rng.uniform(0.90, 1.60), 2),
+            show_barcode_text=rng.random() < 0.80,
+            font_family=rng.choice(THEME_FONT_FAMILIES),
+            title_size=round(rng.uniform(14.0, 22.0), 1),
+            body_size=round(rng.uniform(7.0, 10.0), 1),
+            label_size=round(rng.uniform(8.0, 11.0), 1),
+            line_leading=round(rng.uniform(1.15, 1.50), 2),
+            uppercase_labels=rng.random() < 0.35,
+            has_outer_border=has_outer_border,
+            border_width=round(rng.uniform(0.6, 1.6), 1) if has_outer_border else 0.0,
+            border_color=rng.choice(THEME_BORDER_COLORS) if has_outer_border else "#FFFFFF",
+            has_divider=has_divider,
+            divider_style=rng.choice(THEME_DIVIDER_STYLES) if has_divider else "none",
+            accent_color=rng.choice(THEME_ACCENT_COLORS),
+            alignment=rng.choice(THEME_ALIGNMENTS),
+            padding=round(rng.uniform(8.0, 18.0), 1),
+            block_order=tuple(block_order),
+            sender_label=sender_label,
+            recipient_label=recipient_label,
+        )
+
+        signature = theme.signature()
+        if signature in seen:
+            continue
+        seen.add(signature)
+        catalog.append(theme)
+
+    if len(catalog) < n:
+        raise RuntimeError(
+            f"Solo se generaron {len(catalog)} temas distintos de {n} solicitados."
+        )
+
+    return catalog
+
+
+def pick_theme(catalog: list[LabelTheme], key: object) -> LabelTheme:
+    """Devuelve un tema del catalogo de forma estable: mismo ``key`` -> mismo tema.
+
+    Usa un hash estable (md5) sobre ``str(key)`` para no depender de la
+    aleatorizacion del hash de Python entre procesos.
+    """
+    if not catalog:
+        raise ValueError("El catalogo de temas esta vacio.")
+    digest = hashlib.md5(str(key).encode("utf-8")).hexdigest()
+    index = int(digest, 16) % len(catalog)
+    return catalog[index]
+
+
+# ---------------------------------------------------------------------------
+# Fin del MOTOR DE TEMAS
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# DIBUJO DE ETIQUETA GENERICA (consume un LabelTheme). SIN marca.
+# ---------------------------------------------------------------------------
+# Independiente de draw_label (etiqueta con marca Encargomio): esta funcion NO
+# dibuja logos, web, telefonos, canales de compra ni el saludo "!Hola!".
+#
+# Estrategia para GARANTIZAR que todo cabe en 4x6 sin solaparse, en cualquier
+# tema:
+#   1. Layout de FLUJO vertical: los bloques se apilan segun theme.block_order,
+#      cada uno debajo del anterior (nada de coordenadas absolutas fijas).
+#   2. Los textos se envuelven/truncan con wrap_text dentro del ancho util.
+#   3. Se mide la altura total y, si excede la pagina, se aplica una escala
+#      global a fuentes y barcode y se vuelve a medir (fuentes grandes + mucho
+#      texto => se encoge hasta caber).
+#   4. Recorte duro de seguridad al dibujar: nunca se pinta por debajo del
+#      margen inferior; si algo no cabe, se corta y se reporta truncado.
+#
+# Nota: draw_code128_barcode fija barWidth=1.2 internamente (ignora el ancho de
+# barra del tema). Para honrar theme.barcode_bar_width y ademas CLAMPEAR el
+# ancho del codigo a su region (que no se salga), se usa un dibujante propio.
+
+GENERIC_TEXT_COLOR = "#111827"
+GENERIC_BORDER_INSET = 3.0
+
+
+def _generic_wrap_capped(
+    text: str, font_name: str, font_size: float, max_width: float, max_lines: int
+) -> tuple[list[str], bool]:
+    """Envuelve el texto y lo limita a ``max_lines`` (con '...' si sobra)."""
+    lines = wrap_text(text, font_name, font_size, max_width)
+    if len(lines) <= max_lines:
+        return lines, False
+    lines = lines[:max_lines]
+    last = lines[-1]
+    while last and stringWidth(last + "...", font_name, font_size) > max_width:
+        last = last[:-1]
+    lines[-1] = (last.rstrip() + "...") if last else "..."
+    return lines, True
+
+
+def _draw_generic_barcode(
+    pdf: "canvas.Canvas",
+    value: str,
+    region_x: float,
+    region_width: float,
+    y: float,
+    height: float,
+    bar_width: float,
+) -> tuple[float, float]:
+    """Dibuja un Code128 centrado dentro de [region_x, region_x+region_width].
+
+    Respeta ``bar_width`` del tema y reduce el grosor si el codigo no cabe en la
+    region, de modo que nunca se salga horizontalmente. Devuelve (x, ancho).
+    """
+    ensure_reportlab()
+    bw = max(0.4, bar_width)
+    drawing = createBarcodeDrawing(
+        "Code128", value=value, barHeight=height, barWidth=bw, humanReadable=False
+    )
+    # El ancho del Code128 NO escala linealmente con barWidth (reportlab cuantiza
+    # el grosor de barra), asi que un solo reescalado puede quedar unos puntos por
+    # encima de la region. Iteramos con un pequeno margen hasta que quepa.
+    guard = 0
+    while drawing.width > region_width and drawing.width > 0 and guard < 8:
+        bw = bw * (region_width / drawing.width) * 0.98
+        drawing = createBarcodeDrawing(
+            "Code128", value=value, barHeight=height, barWidth=bw, humanReadable=False
+        )
+        guard += 1
+    draw_x = region_x + max(0.0, (region_width - drawing.width) / 2)
+    renderPDF.draw(drawing, pdf, draw_x, y)
+    return draw_x, drawing.width
+
+
+def _draw_generic_divider(
+    pdf: "canvas.Canvas", x0: float, x1: float, y: float, theme: LabelTheme
+) -> None:
+    """Dibuja una linea divisoria segun theme.divider_style."""
+    pdf.setStrokeColor(HexColor(theme.accent_color))
+    pdf.setLineWidth(0.7)
+    style = theme.divider_style
+    if style == "dashed":
+        pdf.setDash(4, 2)
+    elif style == "dotted":
+        pdf.setDash(1, 2)
+    else:
+        pdf.setDash()
+    if style == "double":
+        pdf.setDash()
+        pdf.line(x0, y + 1.0, x1, y + 1.0)
+        pdf.line(x0, y - 1.0, x1, y - 1.0)
+    else:
+        pdf.line(x0, y, x1, y)
+    pdf.setDash()
+
+
+def draw_generic_label(pdf: "canvas.Canvas", row: LabelRow, theme: LabelTheme) -> dict:
+    """Dibuja una etiqueta GENERICA (sin marca) en 4x6 usando ``theme``.
+
+    Devuelve un reporte: {truncated, wrap_truncated, hard_truncated, scale,
+    bbox:(min_x,min_y,max_x,max_y), content:(left,bottom,right,top)}.
+    """
+    ensure_reportlab()
+
+    pad = float(theme.padding)
+    content_left = pad
+    content_right = PAGE_WIDTH - pad
+    content_top = PAGE_HEIGHT - pad
+    content_bottom = pad
+    content_width = content_right - content_left
+    available_height = content_top - content_bottom
+    indent = 2.0
+    center_x = (content_left + content_right) / 2.0
+    font = theme.font_family
+    leading = theme.line_leading
+
+    # --- Construccion medible de bloques (para una escala dada) -------------
+    def build_blocks(scale: float):
+        title_sz = max(9.0, theme.title_size * scale)
+        body_sz = max(5.0, theme.body_size * scale)
+        label_sz = max(6.0, theme.label_size * scale)
+        text_width = content_width - 2 * indent
+        wrap_trunc = False
+
+        def line_h(sz: float) -> float:
+            return sz * leading
+
+        def text_item(text: str, sz: float, color: str, is_label: bool = False) -> dict:
+            return {
+                "kind": "text",
+                "text": text,
+                "size": sz,
+                "color": color,
+                "height": line_h(sz),
+                "is_label": is_label,
+            }
+
+        def address_block(label_text, name, address, city, state):
+            nonlocal wrap_trunc
+            items = [
+                text_item(
+                    label_text.upper() if theme.uppercase_labels else label_text,
+                    label_sz,
+                    theme.accent_color,
+                    is_label=True,
+                )
+            ]
+            name_lines, t = _generic_wrap_capped(name or "N/D", font, body_sz, text_width, 1)
+            wrap_trunc = wrap_trunc or t
+            for ln in name_lines:
+                items.append(text_item(ln, body_sz, GENERIC_TEXT_COLOR))
+            if address:
+                addr_lines, t = _generic_wrap_capped(address, font, body_sz, text_width, 2)
+                wrap_trunc = wrap_trunc or t
+                for ln in addr_lines:
+                    items.append(text_item(ln, body_sz, GENERIC_TEXT_COLOR))
+            city_state = " ".join(part for part in [city, state] if part)
+            if city_state:
+                cs_lines, t = _generic_wrap_capped(city_state, font, body_sz, text_width, 1)
+                wrap_trunc = wrap_trunc or t
+                for ln in cs_lines:
+                    items.append(text_item(ln, body_sz, GENERIC_TEXT_COLOR))
+            return items
+
+        blocks: dict[str, list[dict]] = {}
+        blocks["sender"] = address_block(
+            theme.sender_label, row.sender_name, row.sender_address,
+            row.sender_city, row.sender_state,
+        )
+        blocks["recipient"] = address_block(
+            theme.recipient_label, row.recipient_name, row.recipient_address,
+            row.recipient_city, row.recipient_state,
+        )
+
+        content_items: list[dict] = []
+        c_lines, t = _generic_wrap_capped(row.content or "N/D", font, body_sz, text_width, 2)
+        wrap_trunc = wrap_trunc or t
+        for ln in c_lines:
+            content_items.append(text_item(ln, body_sz, GENERIC_TEXT_COLOR))
+        weight = format_weight(row.weight_lb, row.weight_kg) or "N/D"
+        pw_text = f"Piezas: {row.pieces or '1'}   Peso: {weight}"
+        pw_lines, t = _generic_wrap_capped(pw_text, font, body_sz, text_width, 1)
+        wrap_trunc = wrap_trunc or t
+        for ln in pw_lines:
+            content_items.append(text_item(ln, body_sz, GENERIC_TEXT_COLOR))
+        blocks["content"] = content_items
+
+        bar_h = max(16.0, theme.barcode_height * scale)
+        # El numero legible del barcode usa title_size (el texto mas prominente),
+        # reducido si no cabe a lo ancho (es un token unico, no se puede envolver).
+        num_text = (row.shipment_number or "").strip() or "0"
+        num_size = max(6.0, title_sz)
+        while num_size > 6.0 and stringWidth(num_text, font, num_size) > text_width:
+            num_size -= 0.5
+        show_text = theme.show_barcode_text
+        barcode_total = bar_h + (2.0 + line_h(num_size) if show_text else 0.0)
+        blocks["barcode"] = [{
+            "kind": "barcode",
+            "value": num_text,
+            "bar_height": bar_h,
+            "bar_width": theme.barcode_bar_width,
+            "show_text": show_text,
+            "num_size": num_size,
+            "gap": 2.0,
+            "height": barcode_total,
+        }]
+
+        gap = max(3.0, body_sz * 0.8)
+        ordered = [(name, blocks[name]) for name in theme.block_order]
+        total = 0.0
+        for i, (_, items) in enumerate(ordered):
+            total += sum(it["height"] for it in items)
+            if i < len(ordered) - 1:
+                total += gap
+        return ordered, total, wrap_trunc, gap
+
+    # --- Escala-para-caber ---------------------------------------------------
+    # Se reserva un colchon inferior (para el descendente de la ultima linea)
+    # de modo que la escala absorba el sobrante antes de tener que recortar.
+    bottom_cushion = 6.0
+    available_fit = available_height - bottom_cushion
+    scale = 1.0
+    ordered, total, wrap_trunc, gap = build_blocks(scale)
+    for _ in range(80):
+        if total <= available_fit or scale <= 0.4:
+            break
+        scale *= 0.95
+        ordered, total, wrap_trunc, gap = build_blocks(scale)
+
+    # --- Dibujo --------------------------------------------------------------
+    extents: list[tuple[float, float, float, float]] = []
+
+    def record(x0: float, y0: float, x1: float, y1: float) -> None:
+        extents.append((x0, y0, x1, y1))
+
+    pdf.setFillColor(HexColor("#FFFFFF"))
+    pdf.rect(0, 0, PAGE_WIDTH, PAGE_HEIGHT, stroke=0, fill=1)
+
+    if theme.has_outer_border:
+        inset = GENERIC_BORDER_INSET
+        pdf.setStrokeColor(HexColor(theme.border_color))
+        pdf.setLineWidth(theme.border_width)
+        pdf.rect(inset, inset, PAGE_WIDTH - 2 * inset, PAGE_HEIGHT - 2 * inset, stroke=1, fill=0)
+
+    hard_trunc = False
+    y_cursor = content_top
+
+    for bi, (_, items) in enumerate(ordered):
+        for it in items:
+            if it["kind"] == "barcode":
+                bar_h = it["bar_height"]
+                if "left" in theme.barcode_position:
+                    region_x, region_w = content_left, content_width * 0.6
+                elif "right" in theme.barcode_position:
+                    region_w = content_width * 0.6
+                    region_x = content_right - region_w
+                else:
+                    region_x, region_w = content_left, content_width
+                bar_bottom = y_cursor - bar_h
+                if bar_bottom < content_bottom:
+                    hard_trunc = True
+                    break
+                draw_x, drawn_w = _draw_generic_barcode(
+                    pdf, it["value"], region_x, region_w, bar_bottom, bar_h, it["bar_width"]
+                )
+                record(draw_x, bar_bottom, draw_x + drawn_w, bar_bottom + bar_h)
+                y_cursor = bar_bottom - it["gap"]
+                if it["show_text"]:
+                    ns = it["num_size"]
+                    y_cursor -= ns * leading
+                    if y_cursor - ns * 0.25 < content_bottom:
+                        hard_trunc = True
+                        break
+                    txt = it["value"]
+                    w = stringWidth(txt, font, ns)
+                    pdf.setFillColor(HexColor(GENERIC_TEXT_COLOR))
+                    pdf.setFont(font, ns)
+                    if "left" in theme.barcode_position:
+                        tx = content_left + indent
+                        pdf.drawString(tx, y_cursor, txt)
+                        record(tx, y_cursor - ns * 0.2, tx + w, y_cursor + ns * 0.8)
+                    elif "right" in theme.barcode_position:
+                        tx = content_right - indent
+                        pdf.drawRightString(tx, y_cursor, txt)
+                        record(tx - w, y_cursor - ns * 0.2, tx, y_cursor + ns * 0.8)
+                    else:
+                        pdf.drawCentredString(center_x, y_cursor, txt)
+                        record(center_x - w / 2, y_cursor - ns * 0.2, center_x + w / 2, y_cursor + ns * 0.8)
+            else:
+                sz = it["size"]
+                y_cursor -= it["height"]
+                if y_cursor - sz * 0.25 < content_bottom:
+                    hard_trunc = True
+                    break
+                txt = it["text"]
+                w = stringWidth(txt, font, sz)
+                pdf.setFillColor(HexColor(it["color"]))
+                pdf.setFont(font, sz)
+                if theme.alignment == "center":
+                    pdf.drawCentredString(center_x, y_cursor, txt)
+                    x0, x1 = center_x - w / 2, center_x + w / 2
+                else:
+                    x0 = content_left + indent
+                    pdf.drawString(x0, y_cursor, txt)
+                    x1 = x0 + w
+                record(x0, y_cursor - sz * 0.2, x1, y_cursor + sz * 0.8)
+        if hard_trunc:
+            break
+        if bi < len(ordered) - 1:
+            divider_y = y_cursor - gap / 2
+            if theme.has_divider and divider_y > content_bottom:
+                _draw_generic_divider(pdf, content_left, content_right, divider_y, theme)
+                record(content_left, divider_y - 1.0, content_right, divider_y + 1.0)
+            y_cursor -= gap
+
+    if extents:
+        min_x = min(e[0] for e in extents)
+        min_y = min(e[1] for e in extents)
+        max_x = max(e[2] for e in extents)
+        max_y = max(e[3] for e in extents)
+    else:
+        min_x = min_y = max_x = max_y = 0.0
+
+    return {
+        "theme_id": theme.theme_id,
+        "scale": round(scale, 3),
+        "wrap_truncated": wrap_trunc,
+        "hard_truncated": hard_trunc,
+        "truncated": bool(wrap_trunc or hard_trunc),
+        "bbox": (round(min_x, 2), round(min_y, 2), round(max_x, 2), round(max_y, 2)),
+        "content": (content_left, content_bottom, content_right, content_top),
+    }
+
+
+def generate_generic_pdf_bytes(row: LabelRow, theme: LabelTheme) -> bytes:
+    """Genera los bytes de un PDF 4x6 con una etiqueta GENERICA segun ``theme``."""
+    ensure_reportlab()
+    buffer = io.BytesIO()
+    pdf = canvas.Canvas(buffer, pagesize=PAGE_SIZE)
+    draw_generic_label(pdf, row, theme)
+    pdf.save()
+    return buffer.getvalue()
+
+
+def generate_generic_zip_bytes(
+    rows: list[LabelRow],
+    catalog: list[LabelTheme] | None = None,
+) -> tuple[bytes, list[dict]]:
+    """Arma un ZIP con una etiqueta GENERICA (sin marca) por fila.
+
+    Paralela a generate_zip_bytes, pero:
+      - Si ``catalog`` es None, lo construye con build_theme_catalog(50).
+      - A cada fila le asigna un tema ESTABLE por guia con pick_theme, asi la
+        misma guia siempre cae en el mismo diseno (reproducible).
+      - Misma logica de nombres/duplicados que generate_zip_bytes (sufijos
+        _2, _3, ... para guias repetidas).
+      - Tolerante a errores por fila: si una fila falla al renderizar, se
+        registra y se continua; NO tumba todo el ZIP.
+
+    Devuelve ``(zip_bytes, failures)`` donde ``failures`` es una lista de
+    ``{"shipment_number", "filename", "error"}`` por cada fila que fallo.
+    """
+    ensure_reportlab()
+    if catalog is None:
+        catalog = build_theme_catalog(50)
+
+    buffer = io.BytesIO()
+    used_names: dict[str, int] = {}
+    failures: list[dict] = []
+
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for row in rows:
+            base_name = sanitize_filename(row.shipment_number)
+            duplicate_number = used_names.get(base_name, 0) + 1
+            used_names[base_name] = duplicate_number
+
+            if duplicate_number == 1:
+                filename = f"{base_name}.pdf"
+            else:
+                filename = f"{base_name}_{duplicate_number}.pdf"
+
+            try:
+                theme = pick_theme(catalog, row.shipment_number)
+                archive.writestr(filename, generate_generic_pdf_bytes(row, theme))
+            except Exception as exc:  # tolerante por fila: una fila mala no rompe el ZIP
+                failures.append({
+                    "shipment_number": row.shipment_number,
+                    "filename": filename,
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+                continue
+
+    return buffer.getvalue(), failures
+
+
+# ---------------------------------------------------------------------------
+# Fin del DIBUJO GENERICO
+# ---------------------------------------------------------------------------
 
 
 def build_parser() -> argparse.ArgumentParser:
