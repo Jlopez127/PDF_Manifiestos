@@ -802,6 +802,22 @@ def pick_theme(catalog: list[LabelTheme], key: object) -> LabelTheme:
 GENERIC_TEXT_COLOR = "#111827"
 GENERIC_BORDER_INSET = 3.0
 
+# Rotulo generico que precede al numero de envio repetido en grande. Varia por
+# tema (indexado por theme_id) sin tocar build_theme_catalog, para no alterar el
+# mapeo estable guia -> diseno ya existente.
+GENERIC_TRACKING_LABELS = ("Envio", "Guia", "Tracking", "Envío")
+
+# Rotulos FIJOS de remitente/destinatario (como la etiqueta con marca). El texto
+# es fijo en los 50 temas; el estilo (mayusculas, fuente, color) sigue el tema.
+GENERIC_SENDER_LABEL = "Remitente"
+GENERIC_RECIPIENT_LABEL = "Destinatario"
+
+# Metricas para reservar la altura REAL del numero de envio grande y garantizar
+# separacion con el codigo de barras (sin solapamiento).
+GENERIC_BIG_ASCENT = 0.80    # alto sobre la linea base (x tamano de fuente)
+GENERIC_BIG_DESCENT = 0.22   # bajo la linea base (x tamano de fuente)
+GENERIC_BIG_BARCODE_GAP = 4.0  # aire fijo entre el numero grande y el barcode
+
 
 def _generic_wrap_capped(
     text: str, font_name: str, font_size: float, max_width: float, max_lines: int
@@ -896,7 +912,6 @@ def draw_generic_label(pdf: "canvas.Canvas", row: LabelRow, theme: LabelTheme) -
 
     # --- Construccion medible de bloques (para una escala dada) -------------
     def build_blocks(scale: float):
-        title_sz = max(9.0, theme.title_size * scale)
         body_sz = max(5.0, theme.body_size * scale)
         label_sz = max(6.0, theme.label_size * scale)
         text_width = content_width - 2 * indent
@@ -943,17 +958,20 @@ def draw_generic_label(pdf: "canvas.Canvas", row: LabelRow, theme: LabelTheme) -
             return items
 
         blocks: dict[str, list[dict]] = {}
+        # Rotulos FIJOS Remitente/Destinatario (se ignora la variacion por tema de
+        # estos dos rotulos; el estilo/mayusculas del tema si se respeta).
         blocks["sender"] = address_block(
-            theme.sender_label, row.sender_name, row.sender_address,
+            GENERIC_SENDER_LABEL, row.sender_name, row.sender_address,
             row.sender_city, row.sender_state,
         )
         blocks["recipient"] = address_block(
-            theme.recipient_label, row.recipient_name, row.recipient_address,
+            GENERIC_RECIPIENT_LABEL, row.recipient_name, row.recipient_address,
             row.recipient_city, row.recipient_state,
         )
 
         content_items: list[dict] = []
-        c_lines, t = _generic_wrap_capped(row.content or "N/D", font, body_sz, text_width, 2)
+        content_text = f"Contenido de la caja: {row.content or 'N/D'}"
+        c_lines, t = _generic_wrap_capped(content_text, font, body_sz, text_width, 2)
         wrap_trunc = wrap_trunc or t
         for ln in c_lines:
             content_items.append(text_item(ln, body_sz, GENERIC_TEXT_COLOR))
@@ -963,18 +981,27 @@ def draw_generic_label(pdf: "canvas.Canvas", row: LabelRow, theme: LabelTheme) -
         wrap_trunc = wrap_trunc or t
         for ln in pw_lines:
             content_items.append(text_item(ln, body_sz, GENERIC_TEXT_COLOR))
+        # Valor declarado + posicion arancelaria (mismo rotulo fijo que la etiqueta
+        # con marca). Va DENTRO del bloque de contenido para no romper el flujo.
+        vt_text = (
+            f"Valor declarado: {row.declared_value or 'N/D'}   "
+            f"Posicion arancelaria: {row.tariff_code or 'N/D'}"
+        )
+        vt_lines, t = _generic_wrap_capped(vt_text, font, body_sz, text_width, 1)
+        wrap_trunc = wrap_trunc or t
+        for ln in vt_lines:
+            content_items.append(text_item(ln, body_sz, GENERIC_TEXT_COLOR))
         blocks["content"] = content_items
 
         bar_h = max(16.0, theme.barcode_height * scale)
-        # El numero legible del barcode usa title_size (el texto mas prominente),
-        # reducido si no cabe a lo ancho (es un token unico, no se puede envolver).
         num_text = (row.shipment_number or "").strip() or "0"
-        num_size = max(6.0, title_sz)
+        # Numero pequeno bajo el codigo (legible), a tamano de rotulo.
+        num_size = max(6.0, label_sz)
         while num_size > 6.0 and stringWidth(num_text, font, num_size) > text_width:
             num_size -= 0.5
         show_text = theme.show_barcode_text
         barcode_total = bar_h + (2.0 + line_h(num_size) if show_text else 0.0)
-        blocks["barcode"] = [{
+        barcode_item = {
             "kind": "barcode",
             "value": num_text,
             "bar_height": bar_h,
@@ -983,7 +1010,28 @@ def draw_generic_label(pdf: "canvas.Canvas", row: LabelRow, theme: LabelTheme) -
             "num_size": num_size,
             "gap": 2.0,
             "height": barcode_total,
-        }]
+        }
+        # Numero de envio repetido en GRANDE (destacado), con rotulo generico que
+        # varia por tema. Va como encabezado del bloque del barcode, dentro del
+        # flujo, para que se mida/escale como los demas items.
+        track_label = GENERIC_TRACKING_LABELS[theme.theme_id % len(GENERIC_TRACKING_LABELS)]
+        if theme.uppercase_labels:
+            track_label = track_label.upper()
+        big_text = f"{track_label} {num_text}".strip()
+        big_size = max(9.0, theme.title_size * 1.5 * scale)
+        while big_size > 4.0 and stringWidth(big_text, font, big_size) > text_width:
+            big_size -= 0.5
+        # Altura reservada = alto real de la fuente (asc+desc) + gap fijo hacia el
+        # barcode. Asi el barcode se ubica desde el borde inferior REAL del numero
+        # grande + gap, garantizando que no se solapen en ningun tema/escala.
+        big_item = {
+            "kind": "bignum",
+            "text": big_text,
+            "size": big_size,
+            "color": theme.accent_color,
+            "height": big_size * (GENERIC_BIG_ASCENT + GENERIC_BIG_DESCENT) + GENERIC_BIG_BARCODE_GAP,
+        }
+        blocks["barcode"] = [big_item, barcode_item]
 
         gap = max(3.0, body_sz * 0.8)
         ordered = [(name, blocks[name]) for name in theme.block_order]
@@ -1024,6 +1072,8 @@ def draw_generic_label(pdf: "canvas.Canvas", row: LabelRow, theme: LabelTheme) -
 
     hard_trunc = False
     y_cursor = content_top
+    big_bbox = None
+    barcode_bbox = None
 
     for bi, (_, items) in enumerate(ordered):
         for it in items:
@@ -1044,6 +1094,7 @@ def draw_generic_label(pdf: "canvas.Canvas", row: LabelRow, theme: LabelTheme) -
                     pdf, it["value"], region_x, region_w, bar_bottom, bar_h, it["bar_width"]
                 )
                 record(draw_x, bar_bottom, draw_x + drawn_w, bar_bottom + bar_h)
+                barcode_bbox = (draw_x, bar_bottom, draw_x + drawn_w, bar_bottom + bar_h)
                 y_cursor = bar_bottom - it["gap"]
                 if it["show_text"]:
                     ns = it["num_size"]
@@ -1066,6 +1117,31 @@ def draw_generic_label(pdf: "canvas.Canvas", row: LabelRow, theme: LabelTheme) -
                     else:
                         pdf.drawCentredString(center_x, y_cursor, txt)
                         record(center_x - w / 2, y_cursor - ns * 0.2, center_x + w / 2, y_cursor + ns * 0.8)
+            elif it["kind"] == "bignum":
+                # Numero de envio grande: se reserva su alto real (asc/desc) y se
+                # deja un gap fijo antes del barcode -> nunca se solapan.
+                sz = it["size"]
+                top = y_cursor
+                baseline = top - GENERIC_BIG_ASCENT * sz
+                bottom = baseline - GENERIC_BIG_DESCENT * sz
+                if bottom - GENERIC_BIG_BARCODE_GAP < content_bottom:
+                    hard_trunc = True
+                    break
+                txt = it["text"]
+                w = stringWidth(txt, font, sz)
+                pdf.setFillColor(HexColor(it["color"]))
+                pdf.setFont(font, sz)
+                if theme.alignment == "center":
+                    pdf.drawCentredString(center_x, baseline, txt)
+                    x0, x1 = center_x - w / 2, center_x + w / 2
+                else:
+                    x0 = content_left + indent
+                    pdf.drawString(x0, baseline, txt)
+                    x1 = x0 + w
+                record(x0, bottom, x1, top)
+                big_bbox = (x0, bottom, x1, top)
+                # el barcode (siguiente item) arranca desde aca, con gap garantizado
+                y_cursor = bottom - GENERIC_BIG_BARCODE_GAP
             else:
                 sz = it["size"]
                 y_cursor -= it["height"]
@@ -1101,12 +1177,30 @@ def draw_generic_label(pdf: "canvas.Canvas", row: LabelRow, theme: LabelTheme) -
     else:
         min_x = min_y = max_x = max_y = 0.0
 
+    # Datos del numero de envio repetido en grande (primer item de texto del
+    # bloque del barcode), para inspeccion/pruebas.
+    big_number_text = ""
+    big_number_size = 0.0
+    for name, items in ordered:
+        if name == "barcode":
+            for it in items:
+                if it["kind"] == "bignum":
+                    big_number_text = it["text"]
+                    big_number_size = round(it["size"], 2)
+                    break
+            break
+
     return {
         "theme_id": theme.theme_id,
         "scale": round(scale, 3),
         "wrap_truncated": wrap_trunc,
         "hard_truncated": hard_trunc,
         "truncated": bool(wrap_trunc or hard_trunc),
+        "big_number": big_number_text,
+        "big_number_size": big_number_size,
+        "body_size": round(max(5.0, theme.body_size * scale), 2),
+        "big_bbox": big_bbox,
+        "barcode_bbox": barcode_bbox,
         "bbox": (round(min_x, 2), round(min_y, 2), round(max_x, 2), round(max_y, 2)),
         "content": (content_left, content_bottom, content_right, content_top),
     }
