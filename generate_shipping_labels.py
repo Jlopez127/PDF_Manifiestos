@@ -324,18 +324,23 @@ def draw_code128_barcode(
     height: float,
 ) -> None:
     ensure_reportlab()
+    # Barras lo mas gruesas posible para que la pistola lea mejor: se parte de un
+    # grosor objetivo y solo se adelgaza si el codigo no cabe en el ancho
+    # disponible (asi nunca se sale del panel).
+    bar_width = 2.0
     drawing = createBarcodeDrawing(
-        "Code128",
-        value=value,
-        barHeight=height,
-        barWidth=1.2,  # 👈 clave (ajusta grosor)
-        humanReadable=False,
+        "Code128", value=value, barHeight=height, barWidth=bar_width, humanReadable=False
     )
+    guard = 0
+    while drawing.width > max_width and drawing.width > 0 and guard < 8:
+        bar_width = bar_width * (max_width / drawing.width) * 0.98
+        drawing = createBarcodeDrawing(
+            "Code128", value=value, barHeight=height, barWidth=bar_width, humanReadable=False
+        )
+        guard += 1
 
-    # 👇 centrado SIN scale
-    actual_width = drawing.width
-    drawing_x = x + (max_width - actual_width) / 2
-
+    # centrado dentro del ancho disponible
+    drawing_x = x + (max_width - drawing.width) / 2
     renderPDF.draw(drawing, pdf, drawing_x, y)
 
 
@@ -364,13 +369,13 @@ def draw_label(pdf: canvas.Canvas, row: LabelRow) -> None:
         pdf,
         barcode_value,
         left_x0 + 4,
-        PAGE_HEIGHT - 56,
+        PAGE_HEIGHT - 66,
         left_width - 8,
-        34,
+        56,
     )
     pdf.setFillColor(HexColor("#111827"))
     pdf.setFont("Helvetica", 8.3)
-    pdf.drawCentredString(left_x0 + left_width / 2, PAGE_HEIGHT - 62, barcode_value)
+    pdf.drawCentredString(left_x0 + left_width / 2, PAGE_HEIGHT - 76, barcode_value)
 
     y = PAGE_HEIGHT - 96
     y = draw_centered_block(
@@ -724,8 +729,8 @@ def build_theme_catalog(n: int = 50) -> list[LabelTheme]:
         theme = LabelTheme(
             theme_id=len(catalog),
             barcode_position=rng.choice(THEME_BARCODE_POSITIONS),
-            barcode_height=round(rng.uniform(28.0, 48.0), 1),
-            barcode_bar_width=round(rng.uniform(0.90, 1.60), 2),
+            barcode_height=round(rng.uniform(42.0, 58.0), 1),
+            barcode_bar_width=round(rng.uniform(1.40, 2.10), 2),
             show_barcode_text=rng.random() < 0.80,
             font_family=rng.choice(THEME_FONT_FAMILIES),
             title_size=round(rng.uniform(14.0, 22.0), 1),
@@ -993,7 +998,7 @@ def draw_generic_label(pdf: "canvas.Canvas", row: LabelRow, theme: LabelTheme) -
             content_items.append(text_item(ln, body_sz, GENERIC_TEXT_COLOR))
         blocks["content"] = content_items
 
-        bar_h = max(16.0, theme.barcode_height * scale)
+        bar_h = max(30.0, theme.barcode_height * scale)
         num_text = (row.shipment_number or "").strip() or "0"
         # Numero pequeno bajo el codigo (legible), a tamano de rotulo.
         num_size = max(6.0, label_sz)
